@@ -108,28 +108,93 @@ All stage actions are performed inside a single sequential always block using `c
 - `sticky = OR(product[23:0])`
 
 ### Stage 6 — Normalize + Round-to-Nearest-Even (RNE)
-This stage performs:
-1. **Underflow alignment** toward exponent -126:
-   - Computes shift amount `sh = (-126 - z_e)` when `z_e < -126`.
-   - Shifts mantissa right and accumulates shifted-out bits into sticky.
-2. **Normalize** if MSB missing:
-   - Left-shifts mantissa while adjusting exponent, carrying guard into LSB.
-3. **RNE rounding**:
-   - If `G == 1` and `(R || S || LSB)` then increment mantissa.
-   - Handles carry-out from rounding:
-     - If rounding overflows mantissa, set mantissa to 0x800000 and increment exponent.
+
+Stage 6 is **one clock cycle** containing **three sub-steps that execute in
+strict sequence** on the same cycle. Sub-steps A and B are mutually exclusive
+(at most one of them fires), but **sub-step C (rounding) is executed on every
+operation, unconditionally**, using the values *produced by* A or B.
+
+> **Implementation note.** Because each sub-step consumes the result of the
+> previous one within the same cycle, write Stage 6 with *blocking* temporaries
+> (`logic [23:0] m; logic signed [9:0] e; logic g, r, s;`) initialised from the
+> registered `z_m / z_e / guard_bit / round_bit / sticky`, apply A/B/C to the
+> temporaries, and assign the temporaries back to the registers at the end.
+> **Do not** structure this stage as
+> `if (underflow) ... else if (normalize) ... else round ...` — that silently
+> skips rounding whenever a shift occurs and produces results that are off by
+> one LSB.
+
+**Sub-step A — Underflow alignment (only when `z_e < -126`)**
+- `sh = -126 - z_e` (number of right-shift positions, may exceed 24).
+- `sticky |= OR(bits of m shifted out) | g | r` — everything that falls off the
+  right end, *including the old guard and round bits*, is folded into sticky.
+- `m = m >> sh`, `g = 0`, `r = 0`, `e = -126`.
+- If `sh >= 24` the mantissa becomes 0 (sticky still set).
+
+**Sub-step B — Left normalization (only when A did not fire and `m[23] == 0`)**
+- `m = {m[22:0], g}` (shift left by one, pulling the guard bit into the LSB).
+- `g = r`, `r = 0`, `e = e - 1`.
+- Only a single left shift is ever required, because the product of two
+  24-bit mantissas with hidden ones is always in `[1.0, 4.0)`.
+
+**Sub-step C — RNE rounding (ALWAYS executed, after A or B)**
+- `if (g && (r || s || m[0]))`  →  `m = m + 1`.
+- If the increment carries out (`m` becomes `24'h000000` after being
+  `24'hFFFFFF`), set `m = 24'h800000` and `e = e + 1`.
+- Write `m → z_m`, `e → z_e` (guard/round/sticky are no longer needed).
 
 ### Stage 7 — Pack
-- For normal path:
-  - Pack sign, biased exponent, fraction.
-  - If exponent indicates overflow -> output INF.
-  - If exponent indicates exact denorm boundary -> force exponent field to 0 (denormal/zero representation).
+- `biased = z_e + 127`.
+- **Overflow:** if `z_e > 127` (i.e. `biased >= 255`) → `z = {z_s, 8'hFF, 23'h0}`
+  (±INF). Note the comparison is *strictly greater than* 127; `z_e == 127`
+  (biased 254) is the largest finite normal and must be packed normally.
+- **Underflow / denormal boundary:** if `z_e == -126 && z_m[23] == 0` the result
+  has no hidden one and is below the smallest normal number. In that case the
+  exponent field **must be 0**: `z = {z_s, 8'h00, z_m[22:0]}`.
+  - This is the *only* path that may produce an exponent field of 0.
+  - A result that is exactly ±0 (mantissa rounded away completely) is
+    therefore `{z_s, 31'h0}`.
+  - Never emit exponent field `8'h01` together with `z_m[23] == 0` — that is
+    not a valid encoding and will not match the reference.
+- **Normal:** otherwise `z = {z_s, biased[7:0], z_m[22:0]}`.
 - Asserts `out_valid` for one cycle and clears `busy`.
+
+### Reference pseudocode for Stages 6–7 (behavioural, not RTL)
+
+```
+# inputs: m (24b), e (signed), g, r, s
+if e < -126:
+    sh = -126 - e
+    s  = s | g | r | (m & ((1 << sh) - 1) != 0)
+    m  = m >> sh
+    g  = 0; r = 0; e = -126
+elif (m >> 23) & 1 == 0:
+    m = ((m << 1) | g) & 0xFFFFFF
+    g = r; r = 0; e = e - 1
+
+# rounding — always
+if g and (r or s or (m & 1)):
+    m = m + 1
+    if m == 0x1000000:
+        m = 0x800000; e = e + 1
+
+# pack
+if e > 127:                       z = sign<<31 | 0xFF<<23
+elif e == -126 and not (m>>23)&1: z = sign<<31 | (m & 0x7FFFFF)
+else:                             z = sign<<31 | ((e+127)&0xFF)<<23 | (m & 0x7FFFFF)
+```
 
 ---
 
 ## Assumptions & Constraints
 - Inputs: `exp ∈ [1..254]` (no zeros/subnormals, no inf/nan)
+- Outputs **are** checked for overflow (→ ±INF) and underflow (→ exponent
+  field 0). Products of two normal inputs can easily fall outside the normal
+  range (e.g. `1e-20 * 1e-20`, `1e30 * 1e30`), so Stage 6-A and the Stage 7
+  overflow / underflow rules **are exercised by the hidden tests**.
+- The result must be a **bit-exact** match to IEEE-754 binary32 multiplication
+  with round-to-nearest-even (e.g. `numpy.float32(a) * numpy.float32(b)` or C
+  `float` multiplication with default rounding).
 
 ---
 
@@ -137,6 +202,25 @@ This stage performs:
 Recommended testbench behavior for this handshake design:
 - Drive `a/b` and pulse `valid` **synchronously** on clock edges.
 - Wait for `out_valid` before sampling `z`.
-- Generate only normal operands,
+- Generate only normal operands.
+
+### Self-check checklist (strongly recommended before finishing)
+Simple hand-picked values such as `1.0 * 2.0` or `0.5 * 0.5` have all-zero
+rounding bits and never exercise Stage 6; passing them proves very little.
+Before declaring the design complete, compare against a software reference
+(e.g. Python `struct` + `numpy.float32`) on **random bit patterns** and make
+sure the following categories are covered:
+
+| Category | Example operands (hex) | What it checks |
+|----------|------------------------|----------------|
+| Random normals | random `exp ∈ [1..254]` | general RNE correctness |
+| Left-normalize **and** round | `a=0x7941bc44 b=0xaa0a787b` → `0xe3d19554` | rounding after sub-step B |
+| Round with carry-out | mantissas near `0xFFFFFF` | `m` wraps to `0x800000`, `e+1` |
+| Underflow → 0 | `a=0xa749396f b=0x8991bcc2` → `0x00000000` | sub-step A + exp field 0 |
+| Underflow boundary | `a=0x89b7af44 b=0x840ccd48` → `0x00000000` | `e == -126 && !m[23]` rule |
+| Overflow → INF | `a=0x7f000000 b=0x7f000000` → `0x7f800000` | `e > 127` test |
+| Largest finite | `a=0x7f7fffff b=0x3f800000` → `0x7f7fffff` | `e == 127` must *not* be INF |
+
+A design that passes `1.0 * 2.0` but fails any row above is **not** complete.
 
 ---

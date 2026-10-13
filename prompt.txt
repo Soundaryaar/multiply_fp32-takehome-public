@@ -2,5 +2,6 @@ Complete the given partial Systemverilog RTL code based on the specification doc
 Make sure that the name of the files match with the following:
 - Top:        multiply_fp32.sv
 
+The result must be bit-exact against IEEE-754 binary32 multiplication (round-to-nearest-even), including overflow and underflow cases. Pay close attention to the Stage 6 / Stage 7 ordering rules in doc/spec.md and run the self-check checklist in the spec (random vectors against a software reference, not just hand-picked values) before finishing.
 
 **Important**: This environment uses Icarus Verilog for testing. Avoid using SystemVerilog Assertion (SVA) property/sequence syntax if adding assertions.$
