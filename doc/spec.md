@@ -159,31 +159,6 @@ operation, unconditionally**, using the values *produced by* A or B.
 - **Normal:** otherwise `z = {z_s, biased[7:0], z_m[22:0]}`.
 - Asserts `out_valid` for one cycle and clears `busy`.
 
-### Reference pseudocode for Stages 6–7 (behavioural, not RTL)
-
-```
-# inputs: m (24b), e (signed), g, r, s
-if e < -126:
-    sh = -126 - e
-    s  = s | g | r | (m & ((1 << sh) - 1) != 0)
-    m  = m >> sh
-    g  = 0; r = 0; e = -126
-elif (m >> 23) & 1 == 0:
-    m = ((m << 1) | g) & 0xFFFFFF
-    g = r; r = 0; e = e - 1
-
-# rounding — always
-if g and (r or s or (m & 1)):
-    m = m + 1
-    if m == 0x1000000:
-        m = 0x800000; e = e + 1
-
-# pack
-if e > 127:                       z = sign<<31 | 0xFF<<23
-elif e == -126 and not (m>>23)&1: z = sign<<31 | (m & 0x7FFFFF)
-else:                             z = sign<<31 | ((e+127)&0xFF)<<23 | (m & 0x7FFFFF)
-```
-
 ---
 
 ## Assumptions & Constraints
@@ -211,15 +186,15 @@ Before declaring the design complete, compare against a software reference
 (e.g. Python `struct` + `numpy.float32`) on **random bit patterns** and make
 sure the following categories are covered:
 
-| Category | Example operands (hex) | What it checks |
-|----------|------------------------|----------------|
-| Random normals | random `exp ∈ [1..254]` | general RNE correctness |
-| Left-normalize **and** round | `a=0x7941bc44 b=0xaa0a787b` → `0xe3d19554` | rounding after sub-step B |
-| Round with carry-out | mantissas near `0xFFFFFF` | `m` wraps to `0x800000`, `e+1` |
-| Underflow → 0 | `a=0xa749396f b=0x8991bcc2` → `0x00000000` | sub-step A + exp field 0 |
-| Underflow boundary | `a=0x89b7af44 b=0x840ccd48` → `0x00000000` | `e == -126 && !m[23]` rule |
-| Overflow → INF | `a=0x7f000000 b=0x7f000000` → `0x7f800000` | `e > 127` test |
-| Largest finite | `a=0x7f7fffff b=0x3f800000` → `0x7f7fffff` | `e == 127` must *not* be INF |
+| Category | How to generate | What it checks |
+|----------|-----------------|----------------|
+| Random normals | random `exp ∈ [1..254]`, random mantissas | general RNE correctness |
+| Left-normalize **and** round | operands whose mantissa product is `< 2.0` with non-zero low bits | rounding after sub-step B |
+| Round with carry-out | mantissas near all-ones | `m` wraps to `0x800000`, `e+1` |
+| Underflow → 0 | both operands with very small exponents | sub-step A + exp field 0 |
+| Underflow boundary | products whose exponent lands exactly at `-126` | `e == -126 && !m[23]` rule |
+| Overflow → INF | both operands with very large exponents | `e > 127` test |
+| Largest finite | `FLT_MAX * 1.0` | `e == 127` must *not* be INF |
 
 A design that passes `1.0 * 2.0` but fails any row above is **not** complete.
 
